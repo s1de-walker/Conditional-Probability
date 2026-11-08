@@ -66,10 +66,19 @@ def compute_returns(prices: pd.DataFrame, h: int, overlapping: bool) -> pd.DataF
     return prices.iloc[::h].pct_change(fill_method=None)
 
 
-def slice_window(df: pd.DataFrame, mode: str, n: int, since: date) -> pd.DataFrame:
-    if mode == "Last N trading days":
-        return df.iloc[-n:]
-    return df.loc[str(since):]
+def slice_window(df: pd.DataFrame, start, end) -> pd.DataFrame:
+    return df.loc[start:end]
+
+
+PRESETS = {
+    "Since 1 Jan 2021": lambda ix: (pd.Timestamp(2021, 1, 1), ix[-1]),
+    "Last 300 trading days": lambda ix: (ix[max(0, len(ix) - 300)], ix[-1]),
+    "Last 1 year": lambda ix: (ix[-1] - pd.DateOffset(years=1), ix[-1]),
+    "Last 3 years": lambda ix: (ix[-1] - pd.DateOffset(years=3), ix[-1]),
+    "Last 5 years": lambda ix: (ix[-1] - pd.DateOffset(years=5), ix[-1]),
+    "Year to date": lambda ix: (pd.Timestamp(ix[-1].year, 1, 1), ix[-1]),
+    "Max available": lambda ix: (ix[0], ix[-1]),
+}
 
 
 def conditional_stats(R, conds, targets, mode, lag, thr, min_obs):
@@ -87,15 +96,25 @@ def conditional_stats(R, conds, targets, mode, lag, thr, min_obs):
             continue
         r_sig, r_all = tgt.loc[sig, t], tgt.loc[valid, t]
         p_c, p_b = (r_sig > thr).mean(), (r_all > thr).mean()
+        up, dn = r_sig[r_sig > 0], r_sig[r_sig <= 0]
+        p_up = len(up) / len(r_sig)
+        avg_win = up.mean() if len(up) else 0.0
+        avg_loss = dn.mean() if len(dn) else 0.0
+        ev_c = p_up * avg_win + (1 - p_up) * avg_loss   # == mean return | condition
+        ev_b = r_all.mean()
         rows.append({
             "Target": t,
             "Signals": n,
             "P(target > thr | cond) %": p_c * 100,
             "Base P %": p_b * 100,
             "Lift (pp)": (p_c - p_b) * 100,
-            "Avg ret | cond %": r_sig.mean() * 100,
+            "P(up | cond) %": p_up * 100,
+            "Avg win %": avg_win * 100,
+            "Avg loss %": avg_loss * 100,
+            "EV | cond %": ev_c * 100,
+            "EV base %": ev_b * 100,
+            "EV edge (pp)": (ev_c - ev_b) * 100,
             "Median ret | cond %": r_sig.median() * 100,
-            "Avg ret base %": r_all.mean() * 100,
         })
     out = pd.DataFrame(rows)
     if not out.empty:
@@ -109,35 +128,46 @@ def conditional_stats(R, conds, targets, mode, lag, thr, min_obs):
 with st.sidebar:
     st.header("Controls")
 
-    st.subheader("Timeline")
-    tl_mode = st.radio(
-        "Window", ["Last N trading days", "Since date"], index=1, label_visibility="collapsed"
+    st.subheader("Return horizon")
+    hz_label = st.radio(
+        "Horizon", ["Weekly (5d)", "15 days", "Monthly (21d)", "Custom"], index=2,
+        label_visibility="collapsed",
     )
-    if tl_mode == "Last N trading days":
-        n_days = st.number_input("N trading days", 30, 2000, 300, step=10)
-        since = date(2021, 1, 1)
+    if hz_label == "Custom":
+        horizon = int(st.number_input("Trading days", 1, 120, 10))
     else:
-        since = st.date_input("Start date", date(2021, 1, 1), min_value=date(2015, 1, 1))
-        n_days = 300
-
-    st.subheader("Returns")
-    hz_label = st.selectbox("Horizon", list(HORIZONS), index=2)
+        horizon = HORIZONS[hz_label]
     overlapping = st.toggle(
         "Overlapping windows", value=True,
         help="On: rolling returns every day (more observations, but autocorrelated). "
              "Off: independent non-overlapping blocks.",
     )
 
+    st.subheader("Timeline")
+    tl_mode = st.radio(
+        "Timeline mode", ["Quick preset", "Since date", "Date range", "Last N trading days"],
+        label_visibility="collapsed",
+    )
+    if tl_mode == "Quick preset":
+        preset = st.selectbox("Preset", list(PRESETS), index=0)
+    elif tl_mode == "Since date":
+        since = st.date_input("From", date(2021, 1, 1), min_value=date(2005, 1, 1), format="DD/MM/YYYY")
+    elif tl_mode == "Date range":
+        d1, d2 = st.columns(2)
+        range_start = d1.date_input("From", date(2022, 1, 21), min_value=date(2005, 1, 1), format="DD/MM/YYYY")
+        range_end = d2.date_input("To", date(2025, 7, 4), format="DD/MM/YYYY")
+    else:
+        n_days = int(st.number_input("N trading days", 30, 3000, 300, step=10))
+
     with st.expander("Universe & data source"):
         f_text = st.text_area("Factor ETFs", ", ".join(DEFAULT_FACTORS), height=90)
         s_text = st.text_area("Sector ETFs", ", ".join(DEFAULT_SECTORS), height=160)
         suffix = st.selectbox("Exchange suffix", [".NS", ".BO", ""], index=0)
-        dl_start = st.date_input("Download history from", date(2020, 6, 1))
+        dl_start = st.date_input("Download history from", date(2015, 1, 1), format="DD/MM/YYYY")
         if st.button("Refresh data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
-horizon = HORIZONS[hz_label]
 factor_list = parse_tickers(f_text)
 sector_list = [t for t in parse_tickers(s_text) if t not in factor_list]
 
@@ -169,8 +199,32 @@ if missing:
     st.warning(f"No data for: {', '.join(missing)} (check the ticker symbols).")
 
 ret_full = compute_returns(prices, horizon, overlapping)
-R = slice_window(ret_full, tl_mode, n_days, since)
-px_win = slice_window(prices, tl_mode, n_days, since)
+ix = prices.index
+if tl_mode == "Quick preset":
+    w_start, w_end = PRESETS[preset](ix)
+elif tl_mode == "Since date":
+    w_start, w_end = pd.Timestamp(since), ix[-1]
+elif tl_mode == "Date range":
+    w_start, w_end = pd.Timestamp(range_start), pd.Timestamp(range_end)
+else:
+    w_start, w_end = ix[max(0, len(ix) - n_days)], ix[-1]
+
+if w_start >= w_end:
+    st.error("Start date must be before end date.")
+    st.stop()
+
+R = slice_window(ret_full, w_start, w_end)
+px_win = slice_window(prices, w_start, w_end)
+if px_win.empty:
+    st.error("No data in the selected window. Try a different timeline.")
+    st.stop()
+if w_start < ix[0]:
+    st.info(f"Data starts {ix[0]:%d %b %Y}; the window is clipped to that.")
+
+st.caption(
+    f"Window **{px_win.index[0]:%d %b %Y} → {px_win.index[-1]:%d %b %Y}** · "
+    f"horizon **{horizon}d** · {'overlapping' if overlapping else 'non-overlapping'} returns"
+)
 
 # ----------------------------------------------------------------------
 # Tabs
@@ -234,13 +288,13 @@ with tab_ex:
             long = R[sel].dropna(how="all").melt(var_name="Ticker", value_name="Return").dropna()
             long["Return"] *= 100
             fig = px.box(long, x="Ticker", y="Return", points=False,
-                         title=f"Distribution of {hz_label} returns (%)")
+                         title=f"Distribution of {horizon}d returns (%)")
             fig.add_hline(y=0, line_dash="dot", line_color="grey")
             fig.update_layout(xaxis_title=None, yaxis_title=None,
                               margin=dict(l=0, r=0, t=40, b=0), height=400)
             st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader(f"{hz_label} return summary")
+    st.subheader(f"{horizon}d return summary")
     summ = R.describe().T[["count", "mean", "std", "min", "50%", "max"]]
     summ[["mean", "std", "min", "50%", "max"]] *= 100
     summ["% positive"] = (R > 0).sum() / R.notna().sum() * 100
@@ -319,28 +373,39 @@ with tab_cp:
     if res.empty:
         st.warning("No target has enough signal observations. Lower the thresholds, shorten the lag, or reduce Min signals.")
     else:
-        res["Direction"] = np.where(res["Lift (pp)"] >= 0, "Above base", "Below base")
+        rank_by = st.selectbox("Rank & chart by", ["EV edge (pp)", "EV | cond %", "Lift (pp)"], index=0)
+        res = res.sort_values(rank_by, ascending=False).reset_index(drop=True)
+        res["Direction"] = np.where(res[rank_by] >= 0, "Positive", "Negative")
         fig = px.bar(
-            res.sort_values("Lift (pp)"), x="Lift (pp)", y="Target", orientation="h",
-            color="Direction", color_discrete_map={"Above base": "#2e9e5b", "Below base": "#c8473d"},
+            res.sort_values(rank_by), x=rank_by, y="Target", orientation="h",
+            color="Direction", color_discrete_map={"Positive": "#2e9e5b", "Negative": "#c8473d"},
             hover_data={"Signals": True, "Direction": False},
-            title="Lift in P(target return > threshold) vs base rate",
+            title=f"{rank_by} by target (condition vs unconditional)",
         )
-        fig.update_layout(showlegend=False, yaxis_title=None, xaxis_title="percentage points",
+        fig.update_layout(showlegend=False, yaxis_title=None,
                           margin=dict(l=0, r=0, t=40, b=0), height=max(280, 26 * len(res) + 90))
         st.plotly_chart(fig, use_container_width=True)
 
+        st.caption("**EV | cond** = P(up)·avg win + P(down)·avg loss, i.e. the mean target return when the condition fires. "
+                   "**EV edge** = EV | cond − unconditional EV.")
+        order = ["Target", "Signals", "P(target > thr | cond) %", "Base P %", "Lift (pp)", "P(up | cond) %",
+                 "Avg win %", "Avg loss %", "EV | cond %", "EV base %", "EV edge (pp)", "Median ret | cond %"]
         st.dataframe(
-            res.drop(columns="Direction"), use_container_width=True, hide_index=True,
+            res[order], use_container_width=True, hide_index=True,
             column_config={
                 "Signals": st.column_config.NumberColumn(format="%d"),
                 "P(target > thr | cond) %": st.column_config.ProgressColumn(
                     "P(tgt > thr | cond)", min_value=0, max_value=100, format="%.0f%%"),
                 "Base P %": st.column_config.NumberColumn("Base P", format="%.0f%%"),
                 "Lift (pp)": st.column_config.NumberColumn("Lift", format="%+.1f pp"),
-                "Avg ret | cond %": st.column_config.NumberColumn("Avg | cond", format="%+.2f%%"),
+                "P(up | cond) %": st.column_config.ProgressColumn(
+                    "P(up | cond)", min_value=0, max_value=100, format="%.0f%%"),
+                "Avg win %": st.column_config.NumberColumn("Avg win", format="%+.2f%%"),
+                "Avg loss %": st.column_config.NumberColumn("Avg loss", format="%+.2f%%"),
+                "EV | cond %": st.column_config.NumberColumn("EV | cond", format="%+.2f%%"),
+                "EV base %": st.column_config.NumberColumn("EV base", format="%+.2f%%"),
+                "EV edge (pp)": st.column_config.NumberColumn("EV edge", format="%+.2f pp"),
                 "Median ret | cond %": st.column_config.NumberColumn("Median | cond", format="%+.2f%%"),
-                "Avg ret base %": st.column_config.NumberColumn("Avg base", format="%+.2f%%"),
             },
         )
 
